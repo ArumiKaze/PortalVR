@@ -71,7 +71,6 @@ void APortalVR::BeginPlay()
 	FTimerDelegate timerDel;
 	timerDel.BindUFunction(this, "Init");
 	GetWorldTimerManager().SetTimer(timer, timerDel, 1.0f, false, 1.0f);
-	//Init();
 }
 
 void APortalVR::Init()
