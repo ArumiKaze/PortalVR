@@ -66,11 +66,18 @@ void APortalVR::BeginPlay()
 {
 	Super::BeginPlay();
 
-	Init();
+	PrimaryActorTick.SetTickFunctionEnable(false);
+	FTimerHandle timer;
+	FTimerDelegate timerDel;
+	timerDel.BindUFunction(this, "Init");
+	GetWorldTimerManager().SetTimer(timer, timerDel, 1.0f, false, 1.0f);
+	//Init();
 }
 
 void APortalVR::Init()
 {
+	GEngine->AddOnScreenDebugMessage(-1, 15.0f, FColor::Yellow, TEXT("Some debug message!"));
+
 	portalPlayerController = GetWorld()->GetFirstPlayerController();
 	portalPlayerLocal = Cast<UPortalLocalPlayer>(portalPlayerController->GetLocalPlayer());
 	portalPlayerCharacter = Cast<APortalCharacter>(portalPlayerController->GetCharacter());
