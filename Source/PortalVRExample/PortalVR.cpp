@@ -1,29 +1,33 @@
 #include "PortalVR.h"
-#include "HelperMacros.h"
 #include "PortalCharacter.h"
-#include "PortalLocalPlayer.h"
-#include "Components/BoxComponent.h"
-#include "Components/SceneCaptureComponent2D.h"
-#include "Components/CapsuleComponent.h"
+
 #include "Camera/CameraComponent.h"
+#include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "Engine/CanvasRenderTarget2D.h"
-#include "Materials/MaterialInstanceDynamic.h"
-#include "Kismet/GameplayStatics.h"
-#include "Kismet/KismetRenderingLibrary.h"
+#include "Engine/LocalPlayer.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "HelperMacros.h"
+#include "Kismet/GameplayStatics.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetRenderingLibrary.h"
+#include "Materials/MaterialInstanceDynamic.h"
 
-
-//Constructor
 APortalVR::APortalVR()
+	:prevCameraLocation{ 0 }, captureCameraClippingPlaneOffset{ -10.0f }
 {
-	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bCanEverTick = false;
 	PrimaryActorTick.TickGroup = ETickingGroup::TG_PostUpdateWork;
 
-	//Root component/default scene component
+	secondaryPostPhysicsTick.bCanEverTick = false;
+	secondaryPostPhysicsTick.refPortal = this;
+	secondaryPostPhysicsTick.TickGroup = TG_PostPhysics;
+
 	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("DefaultSceneComponent"));
 	RootComponent->Mobility = EComponentMobility::Static;
 
-	//Portal screen mesh
 	portalMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("PortalMesh"));
 	portalMesh->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 	portalMesh->SetCollisionObjectType(ECC_Portal);
@@ -40,6 +44,8 @@ APortalVR::APortalVR()
 	portalLeftCapture->TextureTarget = nullptr;
 	portalLeftCapture->CaptureSource = ESceneCaptureSource::SCS_SceneColorSceneDepth;
 	portalLeftCapture->bAlwaysPersistRenderingState = true;
+	portalLeftCapture->bOverride_CustomNearClippingPlane = true;
+	portalLeftCapture->bUseCustomProjectionMatrix = true;
 	portalLeftCapture->SetupAttachment(RootComponent);
 
 	//Scene capture component for right eye
@@ -52,88 +58,84 @@ APortalVR::APortalVR()
 	portalRightCapture->TextureTarget = nullptr;
 	portalRightCapture->CaptureSource = ESceneCaptureSource::SCS_SceneColorSceneDepth;
 	portalRightCapture->bAlwaysPersistRenderingState = true;
+	portalRightCapture->bOverride_CustomNearClippingPlane = true;
+	portalRightCapture->bUseCustomProjectionMatrix = true;
 	portalRightCapture->SetupAttachment(RootComponent);
 
-	physicsTick.bCanEverTick = false;
-	physicsTick.refPortal = this;
-	physicsTick.TickGroup = TG_PostPhysics;
-
-	resolutionPercentile = 1.0f;
-	recursionAmount = 1;
+	//Default resolution for the portal texture is max resolution for most immersion
+	resolutionScale = 1.0f;
 }
 
 void APortalVR::BeginPlay()
 {
 	Super::BeginPlay();
 
-	PrimaryActorTick.SetTickFunctionEnable(false);
-	FTimerHandle timer;
-	FTimerDelegate timerDel;
-	timerDel.BindUFunction(this, "Init");
-	GetWorldTimerManager().SetTimer(timer, timerDel, 1.0f, false, 1.0f);
+	Init();
 }
 
 void APortalVR::Init()
 {
-	GEngine->AddOnScreenDebugMessage(-1, 15.0f, FColor::Yellow, TEXT("Some debug message!"));
-
 	portalPlayerController = GetWorld()->GetFirstPlayerController();
-	portalPlayerLocal = Cast<UPortalLocalPlayer>(portalPlayerController->GetLocalPlayer());
+	portalPlayerLocal = portalPlayerController->GetLocalPlayer();
 	portalPlayerCharacter = Cast<APortalCharacter>(portalPlayerController->GetCharacter());
 
-	CreatePortalTextures();
+	portalLeftCapture->PostProcessSettings = portalPlayerCharacter->Camera->PostProcessSettings;
+	portalRightCapture->PostProcessSettings = portalPlayerCharacter->Camera->PostProcessSettings;
 
-	if (!portalTarget || !portalPlayerController || !portalPlayerLocal || !portalPlayerCharacter || !renderLeftTarget || !renderRightTarget || !portalMaterial)
+	CreatePortalTexturesAndMaterial();
+
+	//Asserting these here as these should never be missing/null before starting tick
+	check(portalPlayerController && portalPlayerLocal && portalPlayerCharacter && renderLeftTarget && renderRightTarget && portalMaterial);
+
+	//Not the end of the world, but output a warning in logs when the portal is not connected to another portal and destroys the actor since we can't render anything to this portal without the other portal
+	if (ensureMsgf(!portalTarget, TEXT("Warning: Portal is not connected to another portal")))
 	{
 		Destroy();
 	}
 
-	physicsTick.bCanEverTick = true;
-	physicsTick.RegisterTickFunction(GetWorld()->PersistentLevel);
-
-	prevCameraLocation = portalPlayerCharacter->Camera->GetComponentLocation();
-
-	PrimaryActorTick.SetTickFunctionEnable(true);
+	//Activate our primary tick and our secondary tick now that everything is ready
+	PrimaryActorTick.bCanEverTick = true;
+	secondaryPostPhysicsTick.bCanEverTick = true;
+	secondaryPostPhysicsTick.RegisterTickFunction(GetWorld()->PersistentLevel);
 }
 
-void APortalVR::PostPhysicsTick(float DeltaTime)
-{
-	UpdateCharacterTracking();
-}
-
+//Remember that this is called because we overrided FActorTickFunction's tick. We can call APortalVR's private member function UpdateCharacterTracking() because FPostPhysicsTick is a friend of APortalVR
 void FPostPhysicsTick::ExecuteTick(float DeltaTime, enum ELevelTick TickType, ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
 {
-	refPortal->PostPhysicsTick(DeltaTime);
+	refPortal->UpdateCharacterTracking();
 }
 
+//Note that the primary tick comes directly after the secondary tick in terms of order
 void APortalVR::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	portalMaterial->SetScalarParameterValue("ScaleOffset", 0.0f);
-	ClearPortalView();
-
 	UpdatePortalView();
 
+	//Don't apply offset to the portal material if the player is far from the portal. Note that the distance is determined by the width of the portal, factoring in scaling too
 	if (FVector::Distance(portalPlayerCharacter->Camera->GetComponentLocation(), portalMesh->GetComponentLocation()) < portalMesh->GetStaticMesh()->GetBoundingBox().Max.Y * portalMesh->GetComponentScale().Y)
 	{
 		portalMaterial->SetScalarParameterValue("ScaleOffset", 1.0f);
 	}
+	else
+	{
+		portalMaterial->SetScalarParameterValue("ScaleOffset", 0.0f);
+	}
 }
 
-void APortalVR::CreatePortalTextures()
+void APortalVR::CreatePortalTexturesAndMaterial()
 {
+	//we get the current viewport size here and multiply it by our scalar to determine our XY resolution for the portal texture
 	int viewportX, viewportY;
 	portalPlayerController->GetViewportSize(viewportX, viewportY);
-	viewportX *= resolutionPercentile;
-	viewportY *= resolutionPercentile;
+	viewportX *= resolutionScale;
+	viewportY *= resolutionScale;
 
-	renderLeftTarget = nullptr;
-	renderRightTarget = nullptr;
 	renderLeftTarget = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(GetWorld(), UCanvasRenderTarget2D::StaticClass(), viewportX, viewportY);
 	renderRightTarget = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(GetWorld(), UCanvasRenderTarget2D::StaticClass(), viewportX, viewportY);
 
-	portalMaterial = portalMesh->CreateDynamicMaterialInstance(0, portalMaterialInstance);
+	//using a dynamic material instance so we can assign the instantiated render targets to the material's textures
+	portalMaterial = portalMesh->CreateDynamicMaterialInstance(0, portalMaterialInterface);
 	portalMaterial->SetTextureParameterValue("RT_LeftEye", renderLeftTarget);
 	portalMaterial->SetTextureParameterValue("RT_RightEye", renderRightTarget);
 
@@ -141,129 +143,94 @@ void APortalVR::CreatePortalTextures()
 	portalRightCapture->TextureTarget = renderRightTarget;
 }
 
-bool APortalVR::IsActorInFrontOfPortal(FVector location)
-{
-	FVector direction = (location - GetActorLocation()).GetSafeNormal();
-	float dotProduct = FVector::DotProduct(direction, GetActorForwardVector());
-	return dotProduct >= 0.0f;
-}
-
 void APortalVR::UpdatePortalView()
 {
-	portalLeftCapture->PostProcessSettings = portalPlayerCharacter->Camera->PostProcessSettings;
-	portalRightCapture->PostProcessSettings = portalPlayerCharacter->Camera->PostProcessSettings;
+	//we enabled and update a clip plane for our cameras so that objects/walls won't be rendered between the cameras and the portal
+	portalLeftCapture->ClipPlaneNormal = portalTarget->GetActorForwardVector();
+	portalLeftCapture->ClipPlaneBase = portalTarget->GetActorLocation() + portalLeftCapture->ClipPlaneNormal * captureCameraClippingPlaneOffset;
+	portalRightCapture->ClipPlaneNormal = portalTarget->GetActorForwardVector();
+	portalRightCapture->ClipPlaneBase = portalTarget->GetActorLocation() + portalRightCapture->ClipPlaneNormal * captureCameraClippingPlaneOffset;
 
-	portalLeftCapture->bEnableClipPlane = true;
-	portalLeftCapture->bOverride_CustomNearClippingPlane = true;
-	portalLeftCapture->ClipPlaneNormal = portalTarget->portalMesh->GetForwardVector();
-	portalLeftCapture->ClipPlaneBase = portalTarget->portalMesh->GetComponentLocation() - portalLeftCapture->ClipPlaneNormal;
+	//we are overriding the camera capture projection with a custom one based on the player's viewport
+	FMatrix projectionMatrix;
+	FSceneViewProjectionData projectionData;
+	portalPlayerLocal->GetProjectionData(portalPlayerLocal->ViewportClient->Viewport, EStereoscopicPass::eSSP_RIGHT_EYE, projectionData);
+	portalRightCapture->CustomProjectionMatrix = projectionData.ProjectionMatrix;
+	portalPlayerLocal->GetProjectionData(portalPlayerLocal->ViewportClient->Viewport, EStereoscopicPass::eSSP_LEFT_EYE, projectionData);
+	portalLeftCapture->CustomProjectionMatrix = projectionData.ProjectionMatrix;
 
-	portalRightCapture->bEnableClipPlane = true;
-	portalRightCapture->bOverride_CustomNearClippingPlane = true;
-	portalRightCapture->ClipPlaneNormal = portalTarget->portalMesh->GetForwardVector();
-	portalRightCapture->ClipPlaneBase = portalTarget->portalMesh->GetComponentLocation() - portalRightCapture->ClipPlaneNormal;
+	//Move and rotate the cameras so that they match the player's perspective through the exit/target portal
+	FVector newCameraLocation;
+	FRotator newCameraRotation;
+	ConvertLocationRotationToPortal(newCameraLocation, newCameraRotation, portalPlayerCharacter->Camera->GetComponentTransform());
+	portalLeftCapture->SetWorldLocationAndRotation(newCameraLocation, newCameraRotation);
+	portalRightCapture->SetWorldLocationAndRotation(newCameraLocation, newCameraRotation);
 
-	portalRightCapture->bUseCustomProjectionMatrix = true;
-	portalRightCapture->CustomProjectionMatrix = portalPlayerLocal->GetCameraProjectionMatrix(EStereoscopicPass::eSSP_RIGHT_EYE);
-	portalLeftCapture->bUseCustomProjectionMatrix = true;
-	portalLeftCapture->CustomProjectionMatrix = portalPlayerLocal->GetCameraProjectionMatrix(EStereoscopicPass::eSSP_LEFT_EYE);
-
-	FVector newCameraLocation = ConvertLocationToPortal(portalPlayerCharacter->Camera->GetComponentLocation(), this, portalTarget);
-	FRotator newCameraRotation = ConvertRotationToPortal(portalPlayerCharacter->Camera->GetComponentRotation(), this, portalTarget);
-
-	for (int i = recursionAmount; i >= 0.0f; --i)
-	{
-		FVector recursiveCameraLocation = newCameraLocation;
-		FRotator recursiveCameraRotation = newCameraRotation;
-
-		for (int j = 0; j < i; ++j)
-		{
-			recursiveCameraLocation = ConvertLocationToPortal(recursiveCameraLocation, this, portalTarget);
-			recursiveCameraRotation = ConvertRotationToPortal(recursiveCameraRotation, this, portalTarget);
-		}
-
-		portalLeftCapture->SetWorldLocationAndRotation(recursiveCameraLocation, recursiveCameraRotation);
-		portalRightCapture->SetWorldLocationAndRotation(recursiveCameraLocation, recursiveCameraRotation);
-
-		if (i == recursionAmount)
-		{
-			portalMesh->SetVisibility(false);
-		}
-
-		portalLeftCapture->CaptureScene();
-		portalRightCapture->CaptureScene();
-
-		if (i == recursionAmount) {
-			portalMesh->SetVisibility(true);
-		}
-	}
+	portalLeftCapture->CaptureScene();
+	portalRightCapture->CaptureScene();
 }
 
-void APortalVR::ClearPortalView()
+bool APortalVR::WasActorInFrontOfPortal(const FVector& location) const
 {
-	UKismetRenderingLibrary::ClearRenderTarget2D(GetWorld(), renderLeftTarget);
-	UKismetRenderingLibrary::ClearRenderTarget2D(GetWorld(), renderRightTarget);
+	FVector directionPlayerMovement{ (location - GetActorLocation()).GetSafeNormal() };
+	return FVector::DotProduct(directionPlayerMovement, GetActorForwardVector()) >= 0.0f;
 }
 
 void APortalVR::UpdateCharacterTracking()
 {
-	FVector currentCameraLocation = portalPlayerCharacter->Camera->GetComponentLocation();
-	if (currentCameraLocation.ContainsNaN())
-	{
-		return;
-	}
+	//We first check whether the VR headset's current location this current frame makes it clip through the portal plane by comparing it to the VR headset's location in the previous frame
+	FPlane portalPlane{ portalMesh->GetComponentLocation(), portalMesh->GetForwardVector() };
+	FVector currentCameraLocation{ portalPlayerCharacter->Camera->GetComponentLocation() };
 	FVector pointInterscetion;
-	FPlane portalPlane = FPlane(portalMesh->GetComponentLocation(), portalMesh->GetForwardVector());
 	bool passedThroughPlane = FMath::SegmentPlaneIntersection(prevCameraLocation, currentCameraLocation, portalPlane, pointInterscetion);
+
+	/*
+	 * Gets relative location of where the headset intersected with the portal plane relative to the portal mesh itself.
+	 * Then check whether the relative location exceeds the size of the portal mesh (with mesh scaling in mind if size was changed via scale by someone)
+	 */
 	FVector relativeIntersection = portalMesh->GetComponentTransform().InverseTransformPositionNoScale(pointInterscetion);
 	FVector portalSize { 0.0f, portalMesh->GetStaticMesh()->GetBoundingBox().Max.Y * portalMesh->GetComponentScale().Y, portalMesh->GetStaticMesh()->GetBoundingBox().Max.Z * portalMesh->GetComponentScale().Z };
-	bool passedWithinPortal = FMath::Abs(relativeIntersection.Z) <= portalSize.Z && FMath::Abs(relativeIntersection.Y) <= portalSize.Y;
+	bool passedWithinPortal{ FMath::Abs(relativeIntersection.Z) <= portalSize.Z && FMath::Abs(relativeIntersection.Y) <= portalSize.Y };
 
-	if (passedThroughPlane && passedWithinPortal && IsActorInFrontOfPortal(prevCameraLocation))
+	//Along with the other two checks we did, also double check whether the actor was indeed in front of the portal and didn't enter from behind the portal
+	if (passedThroughPlane && passedWithinPortal && WasActorInFrontOfPortal(prevCameraLocation))
 	{
-		TeleportActor(portalPlayerCharacter);
+		TeleportCharacter();
 	}
 
 	prevCameraLocation = portalPlayerCharacter->Camera->GetComponentLocation();
 }
 
-void APortalVR::TeleportActor(AActor* actor)
+void APortalVR::TeleportCharacter()
 {
-	if (!actor)
-	{
-		return;
-	}
+	FVector newLocation;
+	FRotator newRotation;
+	ConvertLocationRotationToPortal(newLocation, newRotation, portalPlayerCharacter->GetActorTransform());
 
-	FVector newLocation = ConvertLocationToPortal(actor->GetActorLocation(), this, portalTarget);
-	FRotator newRotation = ConvertRotationToPortal(actor->GetActorRotation(), this, portalTarget);
-	actor->GetRootComponent()->SetWorldLocationAndRotation(newLocation, newRotation, false, nullptr, ETeleportType::TeleportPhysics);
+	portalPlayerCharacter->GetRootComponent()->SetWorldLocationAndRotation(newLocation, newRotation, false, nullptr, ETeleportType::TeleportPhysics);
 
+	/* 
+	 * Translate the old velocity right before the character teleports to a new velocity that takes in account the new direction of the character after teleporting
+	 * If we don't do this, it will keep the old velocity/momentum after the character teleports and it will move with the old momentum very briefly after teleporting causing inconsistent movement
+	 */
+	FVector lastVelocity{ -portalPlayerCharacter->GetVelocity() };
+	FVector relativeVelocity{ UKismetMathLibrary::Dot_VectorVector(lastVelocity, GetActorForwardVector()), UKismetMathLibrary::Dot_VectorVector(lastVelocity, GetActorRightVector()), UKismetMathLibrary::Dot_VectorVector(lastVelocity, GetActorUpVector()) };
+	FVector newVelocity{ relativeVelocity.X * portalTarget->GetActorForwardVector() + relativeVelocity.Y * portalTarget->GetActorRightVector() + relativeVelocity.Z * portalTarget->GetActorUpVector() };
+	portalPlayerCharacter->GetCharacterMovement()->Velocity = newVelocity;
+
+	//"Turn on" the exit portal so that it updates the portal the same frame you teleport
 	portalTarget->portalMaterial->SetScalarParameterValue("ScaleOffset", 1.0f);
 	portalTarget->UpdatePortalView();
 	portalTarget->prevCameraLocation = portalPlayerCharacter->Camera->GetComponentLocation();
 }
 
-FVector APortalVR::ConvertLocationToPortal(FVector location, APortalVR* currentPortal, APortalVR* endPortal, bool flip)
+void APortalVR::ConvertLocationRotationToPortal(FVector& newLocation, FRotator& newRotator, const FTransform& actorTransform) const
 {
-	FVector relativeLocationToPortal = currentPortal->portalMesh->GetComponentTransform().InverseTransformPositionNoScale(location);
-	if (flip)
-	{
-		relativeLocationToPortal.X *= -1.0f;
-		relativeLocationToPortal.Y *= -1.0f;
-	}
-	FVector newWorldLocation = endPortal->portalMesh->GetComponentTransform().TransformPositionNoScale(relativeLocationToPortal);
+	FMatrix actorRelativeMatrix{ actorTransform.ToMatrixWithScale() * GetActorTransform().ToMatrixWithScale().Inverse() };	//Get world to local position (matrix) of our actor/player/camera relative to this portal
+	actorRelativeMatrix *= FRotationMatrix{ FRotator{ 0.0f, 180.0f, 0.0f } };												//Flip the matrix on the Yaw axis because the position should be mirrored for the other portal
+	FMatrix actorWorldMatrix{ actorRelativeMatrix * portalTarget->GetActorTransform().ToMatrixWithScale() };				//Get local to world position (matrix) of our actor/player/camera relative to the target/exit portal
 
-	return newWorldLocation;
-}
-
-FRotator APortalVR::ConvertRotationToPortal(FRotator rotation, APortalVR* currentPortal, APortalVR* endPortal, bool flip)
-{
-	FRotator relativeRotationToPortal = currentPortal->portalMesh->GetComponentTransform().InverseTransformRotation(rotation.Quaternion()).Rotator();
-	if (flip)
-	{
-		relativeRotationToPortal.Yaw += 180.0f;
-	}
-	FRotator newWorldRotation = endPortal->portalMesh->GetComponentTransform().TransformRotation(relativeRotationToPortal.Quaternion()).Rotator();
-
-	return newWorldRotation;
+	//return output via reference
+	newLocation = actorWorldMatrix.GetOrigin();
+	newRotator = actorWorldMatrix.Rotator();
 }
